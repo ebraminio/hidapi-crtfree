@@ -59,16 +59,73 @@ typedef LONG NTSTATUS;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <shlwapi.h>
 
-/* MSVC secure CRT (VS2005+) provides swprintf_s/wcsncpy_s.
-   Older MSVC and GCC/MinGW/Cygwin use the classic variants. */
-#if defined(_MSC_VER) && (_MSC_VER >= 1400)
-#define HIDAPI_SWPRINTF swprintf_s
-#define HIDAPI_WCSNCPY(dest, dest_count, src) wcsncpy_s((dest), (dest_count), (src), _TRUNCATE)
-#else
-#define HIDAPI_SWPRINTF swprintf
-#define HIDAPI_WCSNCPY(dest, dest_count, src) wcsncpy((dest), (src), (dest_count))
+/* CRT-free build: Win32 replacements. wsprintfW is unbounded but capped at 1024 chars by user32. */
+#define HIDAPI_SWPRINTF(buf, count, ...) wsprintfW((buf), __VA_ARGS__)
+#define HIDAPI_WCSNCPY(dest, dest_count, src) lstrcpynW((dest), (src), (int)(dest_count))
+
+#include <intrin.h>
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma function(memcpy, memset, memcmp)
 #endif
+int __cdecl memcmp(const void *a, const void *b, size_t n)
+{
+	const unsigned char *p = (const unsigned char *)a, *q = (const unsigned char *)b;
+	for (; n; --n, ++p, ++q)
+		if (*p != *q)
+			return *p < *q ? -1 : 1;
+	return 0;
+}
+void *__cdecl memcpy(void *d, const void *s, size_t n) { __movsb((unsigned char *)d, (const unsigned char *)s, n); return d; }
+void *__cdecl memset(void *d, int v, size_t n) { __stosb((unsigned char *)d, (unsigned char)v, n); return d; }
+
+static void *hid_internal_alloc(SIZE_T bytes)
+{
+	return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes ? bytes : 1);
+}
+
+static void hid_internal_free(void *p)
+{
+	if (p)
+		HeapFree(GetProcessHeap(), 0, p);
+}
+
+static void *hid_internal_dup(const void *src, SIZE_T bytes)
+{
+	void *dst = hid_internal_alloc(bytes);
+	if (dst)
+		CopyMemory(dst, src, bytes);
+	return dst;
+}
+
+static char *hid_internal_strdup(const char *s)
+{
+	return (char *)hid_internal_dup(s, (SIZE_T)lstrlenA(s) + 1);
+}
+
+static wchar_t *hid_internal_wcsdup(const wchar_t *s)
+{
+	return (wchar_t *)hid_internal_dup(s, ((SIZE_T)lstrlenW(s) + 1) * sizeof(wchar_t));
+}
+
+#undef malloc
+#undef calloc
+#undef free
+#undef wcslen
+#undef wcscmp
+#undef wcsstr
+#undef _wcsdup
+#undef _strdup
+#define malloc(n) hid_internal_alloc(n)
+#define calloc(n, size) hid_internal_alloc((SIZE_T)(n) * (size))
+#define free(p) hid_internal_free(p)
+#define wcslen(s) ((size_t)lstrlenW(s))
+#define wcscmp(a, b) lstrcmpW((a), (b))
+#define wcsstr(a, b) StrStrW((a), (b))
+#define _wcsdup(s) hid_internal_wcsdup(s)
+#define _strdup(s) hid_internal_strdup(s)
 
 #ifdef MIN
 #undef MIN
@@ -450,20 +507,28 @@ static void* hid_internal_get_device_interface_property(const wchar_t* interface
 
 static void hid_internal_towupper(wchar_t* string)
 {
-	for (wchar_t* p = string; *p; ++p) *p = towupper(*p);
+	CharUpperW(string);
 }
 
 static int hid_internal_extract_int_token_value(wchar_t* string, const wchar_t* token)
 {
-	int token_value;
+	int token_value = 0;
 	wchar_t* startptr, * endptr;
 
-	startptr = wcsstr(string, token);
+	startptr = StrStrW(string, token);
 	if (!startptr)
 		return -1;
 
 	startptr += wcslen(token);
-	token_value = wcstol(startptr, &endptr, 16);
+	for (endptr = startptr; ; ++endptr) {
+		wchar_t c = *endptr;
+		int digit;
+		if (c >= L'0' && c <= L'9') digit = c - L'0';
+		else if (c >= L'A' && c <= L'F') digit = c - L'A' + 10;
+		else if (c >= L'a' && c <= L'f') digit = c - L'a' + 10;
+		else break;
+		token_value = (token_value << 4) | digit;
+	}
 	if (endptr == startptr)
 		return -1;
 
